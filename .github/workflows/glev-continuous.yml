@@ -1,0 +1,104 @@
+name: Glev Continuous
+
+# Glev Continuous-in-CI runs SAST analysis on each push and surfaces only the
+# exploitable problems introduced by the change. The actual scanner + posting
+# logic is hosted by Glev — this workflow is a thin wrapper.
+#
+# Setup (one-off, in the repo's GitHub Settings → Secrets and variables → Actions):
+#   GLEV_API_URL         e.g. https://app.glev.ai/functions
+#                        (or an ngrok URL pointing at a local dev stack)
+#   GLEV_TOKEN           service token / JWT issued by Glev for this repo
+#   GLEV_WORKSPACE_REF   workspace UUID
+#   GLEV_REPO_CONFIG_REF repository_configuration UUID
+#
+# To upgrade to a newer Glev script version (e.g. continuous-v1.sh), bump the
+# URL below — no other change needed.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  glev:
+    name: Glev Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: write   # required so the hosted script can create the Check Run via GITHUB_TOKEN
+
+    steps:
+      - name: Checkout (full history needed for --baseline-commit)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install OpenGrep
+        run: |
+          curl -L --output /usr/local/bin/opengrep \
+            https://github.com/opengrep/opengrep/releases/download/v1.16.5/opengrep_manylinux_x86
+          chmod +x /usr/local/bin/opengrep
+
+      - name: Run Glev Continuous
+        id: glev
+        continue-on-error: true   # let upload + check-run-update steps run even on exit 1
+        env:
+          GLEV_API_URL: ${{ secrets.GLEV_API_URL }}
+          GLEV_TOKEN: ${{ secrets.GLEV_TOKEN }}
+          WORKSPACE_REF: ${{ secrets.GLEV_WORKSPACE_REF }}
+          REPO_CONFIG_REF: ${{ secrets.GLEV_REPO_CONFIG_REF }}
+          GLEV_BASE_REF: ${{ github.base_ref || 'main' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsSL "$GLEV_API_URL/ci/continuous-v0.sh" | bash
+
+      - name: Upload Glev artifacts
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: glev-continuous-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            glev-continuous-response.json
+            glev-continuous-summary.md
+            glev-continuous-report.html
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Append artifact link to Glev Check Run summary
+        if: always() && steps.upload.outputs.artifact-url != '' && steps.glev.outputs.check_run_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CHECK_RUN_ID: ${{ steps.glev.outputs.check_run_id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          # PATCH the existing Check Run output.summary to include a clickable
+          # link to the uploaded HTML report. Re-fetches the current summary
+          # because PATCH replaces it entirely.
+          current_summary=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/check-runs/$CHECK_RUN_ID" \
+            | jq -r '.output.summary // ""')
+
+          new_summary=$(printf '%s\n\n📎 **[Download full HTML report](%s)** — open `glev-continuous-report.html` from the artifact for the full Glev-styled view.\n' "$current_summary" "$ARTIFACT_URL")
+
+          patch_payload=$(jq -n \
+            --arg title "Glev Security Scan" \
+            --arg summary "$new_summary" \
+            '{output:{title:$title, summary:$summary}}')
+
+          curl -sS \
+            -X PATCH "https://api.github.com/repos/$REPO/check-runs/$CHECK_RUN_ID" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$patch_payload" > /dev/null
+          echo "Glev Check Run #$CHECK_RUN_ID updated with artifact link"
+
+      - name: Propagate Glev exit code
+        if: always()
+        run: exit ${{ steps.glev.outcome == 'success' && '0' || '1' }}
