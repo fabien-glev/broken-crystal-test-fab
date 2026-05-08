@@ -1,0 +1,94 @@
+name: Glev
+
+# Glev Continuous-in-CI runs SAST analysis on each push and surfaces only the
+# exploitable problems introduced by the change. The actual scanner + posting
+# logic is hosted by Glev — this workflow is a thin wrapper.
+#
+# V0.5: the scanner runs inside the official Glev collector Docker image
+# (same OpenGrep + same rule pack as debt-world), so fingerprints are
+# cross-boundary stable and "issues already analysed by Glev" surface
+# directly via inventory dedup. No `Install OpenGrep` step needed.
+#
+# Setup (one-off, in the repo's GitHub Settings → Secrets and variables → Actions):
+#   GLEV_API_URL         e.g. https://app.glev.ai/functions
+#                        (or an ngrok URL pointing at a local dev stack)
+#   GLEV_TOKEN           service token / JWT issued by Glev for this repo
+#   GLEV_WORKSPACE_REF   workspace UUID
+#   GLEV_REPO_CONFIG_REF repository_configuration UUID
+#
+# Optional override:
+#   GLEV_COLLECTOR_IMAGE pin a specific image tag — recommended once a
+#                        major-version tag is available (e.g. collector:v0).
+#                        Default: rg.fr-par.scw.cloud/public-glev-prod/collector:latest
+#
+# To upgrade to a newer Glev script version (e.g. continuous-v1.sh), bump the
+# URLs below — no other change needed.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: write   # required so the hosted script can create the Check Run via GITHUB_TOKEN
+
+    steps:
+      - name: Checkout (full history needed for git diff base..HEAD)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Glev Continuous
+        id: glev
+        continue-on-error: true   # let upload + finalize steps run even on exit 1
+        env:
+          GLEV_API_URL: ${{ secrets.GLEV_API_URL }}
+          GLEV_TOKEN: ${{ secrets.GLEV_TOKEN }}
+          WORKSPACE_REF: ${{ secrets.GLEV_WORKSPACE_REF }}
+          REPO_CONFIG_REF: ${{ secrets.GLEV_REPO_CONFIG_REF }}
+          GLEV_BASE_REF: ${{ github.base_ref || 'main' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # On `pull_request` events $GITHUB_SHA is the synthetic merge
+          # commit, which is invisible from the PR "Checks" tab. Forward the
+          # actual PR head commit so the Glev Check Run shows up there.
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Optional: pin a specific collector image (testing a feature env, etc.).
+          GLEV_COLLECTOR_IMAGE: ${{ secrets.GLEV_COLLECTOR_IMAGE }}
+        run: curl -fsSL "$GLEV_API_URL/api/v1/ci/continuous-v0.sh" | bash
+
+      - name: Upload Glev artifacts
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: glev-continuous-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            glev-continuous-response.json
+            glev-continuous-summary.md
+            glev-continuous-report.html
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Finalize Glev Check Run (append artifact link)
+        if: always() && steps.upload.outputs.artifact-url != '' && steps.glev.outputs.check_run_id != ''
+        env:
+          GLEV_API_URL: ${{ secrets.GLEV_API_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CHECK_RUN_ID: ${{ steps.glev.outputs.check_run_id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: curl -fsSL "$GLEV_API_URL/api/v1/ci/continuous-v0-finalize.sh" | bash
+
+      # Workflow stays GREEN regardless of vuln verdicts — the "Glev Security
+      # Scan" Check Run posted by the bash carries the failure signal
+      # independently (with the rich summary + annotations). Two distinct
+      # concerns:
+      #   * workflow check  → "did the scan run successfully ?"  (this YAML)
+      #   * Glev check      → "did the scan find exploitable vulns ?"  (server)
+      # Branch protection should require the "Glev Security Scan" check.
