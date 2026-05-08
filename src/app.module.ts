@@ -21,6 +21,7 @@ import { EmailModule } from './email/email.module';
 import { ChatModule } from './chat/chat.module';
 import { SafeFilesModule } from './safe-files/safe-files.module';
 import { McpModule } from './mcp/mcp.module';
+import { GlevTinyModule } from './glev-tiny/glev-tiny.module';
 
 @Module({
   imports: [
@@ -44,7 +45,8 @@ import { McpModule } from './mcp/mcp.module';
     EmailModule,
     ChatModule,
     SafeFilesModule,
-    McpModule
+    McpModule,
+    GlevTinyModule
   ],
   controllers: [AppController],
   providers: [
