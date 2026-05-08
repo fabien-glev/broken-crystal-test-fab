@@ -83,7 +83,7 @@ jobs:
           REPO: ${{ github.repository }}
           CHECK_RUN_ID: ${{ steps.glev.outputs.check_run_id }}
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
-        run: curl -fsSL "$GLEV_API_URL/api/v1/ci/continuous-v0-finalize.sh" | bash
+        run: curl -fsSL "$GLEV_API_URL/api/v1/ci/continuous-v0.sh" | bash -s -- finalize
 
       # Workflow stays GREEN regardless of vuln verdicts — the "Glev Security
       # Scan" Check Run posted by the bash carries the failure signal
